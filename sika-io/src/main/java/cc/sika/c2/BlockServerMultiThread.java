@@ -66,6 +66,17 @@ public class BlockServerMultiThread {
                             "form client = {}",
                     Thread.currentThread().getName(),
                     stringBuilder);
+
+            // 发送“接收成功”的确认消息
+            String confirmationMessage = "Message received successfully\n";
+            ByteBuffer confirmationBuffer = StandardCharsets.UTF_8.encode(confirmationMessage);
+            try {
+                clientChannel.write(confirmationBuffer);
+            } catch (IOException e) {
+                log.error("error sending confirmation message to client", e);
+                tryCloseChannel(clientChannel);
+            }
+
             // clear old message
             stringBuilder.setLength(0);
             // data processing completed, close channel?
