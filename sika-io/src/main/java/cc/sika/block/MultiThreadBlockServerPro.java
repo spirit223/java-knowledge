@@ -1,4 +1,4 @@
-package cc.sika.c2;
+package cc.sika.block;
 
 import lombok.extern.slf4j.Slf4j;
 

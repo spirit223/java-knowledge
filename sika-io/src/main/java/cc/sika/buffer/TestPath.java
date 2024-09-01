@@ -1,4 +1,4 @@
-package cc.sika.c1;
+package cc.sika.buffer;
 
 import java.io.File;
 import java.nio.file.Path;

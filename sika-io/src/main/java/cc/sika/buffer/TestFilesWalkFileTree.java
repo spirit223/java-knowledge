@@ -1,4 +1,4 @@
-package cc.sika.c1;
+package cc.sika.buffer;
 
 import java.io.IOException;
 import java.nio.file.FileVisitResult;
