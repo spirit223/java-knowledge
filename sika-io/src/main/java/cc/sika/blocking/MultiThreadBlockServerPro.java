@@ -32,7 +32,7 @@ public class MultiThreadBlockServerPro {
             server.bind(new InetSocketAddress(HOST, PORT));
             // accept connect
             while (true) {
-                log.info("waiting for client");
+//                log.info("waiting for client");
                 SocketChannel client = server.accept();
                 log.info("client connected {}", client.getRemoteAddress());
                 // process client with new thread
@@ -59,7 +59,7 @@ public class MultiThreadBlockServerPro {
                 int readLength = client.read(buffer);
                 // error client status
                 if (readLength == -1) {
-                    log.error("client was disconnected {}", client);
+                    log.warn("client was disconnected {}", client);
                     return ;
                 }
                 // switch buffer to read mode
