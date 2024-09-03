@@ -43,7 +43,6 @@ public class TestStickyHalfPack {
                     target.put(source.get());
                 }
                 target.flip();
-                operator.accept(target);
                 String targetContent = StandardCharsets.UTF_8.decode(target).toString();
                 System.out.println(targetContent);
             }
