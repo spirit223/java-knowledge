@@ -18,6 +18,12 @@ repositories {
 }
 
 dependencies {
+    implementation("ch.qos.logback:logback-classic:1.5.7")
+    compileOnly ("org.projectlombok:lombok")
+    annotationProcessor("org.projectlombok:lombok")
+
+    testCompileOnly("org.projectlombok:lombok")
+    testAnnotationProcessor("org.projectlombok:lombok")
     implementation("org.springframework.boot:spring-boot-starter")
     implementation("io.netty:netty-all")
     testImplementation("org.springframework.boot:spring-boot-starter-test")
