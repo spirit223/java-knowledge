@@ -30,16 +30,13 @@ public class EventLoopRunTask {
 
         // invoke default task by submit() or execute()
         EventLoop eventLoop = group.next();
-        eventLoop.submit(() -> {
-            log.info("submit by event loop (running default task)");
-        });
+        eventLoop.submit(() -> log.info("submit by event loop (running default task)"));
 
         // eventLoop interface extended ScheduledExecutorService, so it can invoke schedule task
         // invoke schedule task with scheduleAtFixedRate() or scheduleAtFixedDelay()
         // delay one seconds log row message
-        group.next().scheduleAtFixedRate(()->{
-            log.info("schedule by event loop (running schedule task)");
-        }, 0, 1, TimeUnit.SECONDS);
+        group.next().scheduleAtFixedRate(()-> log.info("schedule by event loop (running schedule task)"),
+                0, 1, TimeUnit.SECONDS);
 
         // thread of event loop run task not the same as main
         log.info("main thread");
