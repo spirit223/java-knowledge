@@ -297,7 +297,373 @@ public class EventLoopProcessIO {
 
 ## 2.2 Channel
 
+channel 的主要作用:
+
+- close() 用来关闭channel
+- closeFuture() 处理channel的关闭
+  - sync 同步等待channel关闭
+  - addListener 异步等待channel关闭
+- pipeline 添加处理器
+- write 将数据写入channel(不一定发送)
+- writeAndFlush 写入数据并发送(刷出)
+
+回顾客户端代码
+
+```java
+new Bootstrap()
+.group(new NioEventLoopGroup())
+.channel(NioSocketChannel.class)
+.handler(new ChannelInitializer<NioSocketChannel>() {
+    @Override
+    protected void initChannel(NioSocketChannel ch) throws Exception {
+        ch.pipeline().addLast(new StringEncoder());
+    }
+})
+.connect(new InetSocketAddress("127.0.0.1", 8088))
+.sync()
+.channel().writeAndFlush("hello, world!");
+```
+
+在客户端创建, 连接服务器后调用了 `sync` 方法, 这个方法将会阻塞, 知道实际连接成功, 如果不调用该方法, 在connect方法执行连接请求后就会走到 `channel`方法直接获取到一个channel, 由于网络连接建立需要时间, 此时获取到的channel是一个未连接状态的channel, 直接执行 writeAndFlush 会导致数据丢失, 服务器未能正常接收到数据
+
+> connect方法返回的是一个ChannelFuture接口, sync 和 channel方法都属于该接口
+
+sync是一个阻塞方法, 如果不想客户端阻塞, 可以采用 ChannelFuture 接口的 addListener 方法, 为ChannelFuture添加监听器, 类似回调函数, 在特定的时机执行监听器内容
+
+```java
+ChannelFuture channelFuture = new Bootstrap()
+    .group(new NioEventLoopGroup())
+    .channel(NioSocketChannel.class)
+    .handler(new ChannelInitializer<NioSocketChannel>() {
+        @Override
+        protected void initChannel(NioSocketChannel ch) throws Exception {
+            ch.pipeline().addLast(new StringEncoder(StandardCharsets.UTF_8));
+        }
+    })
+    // connect 返回 ChannelFuture 接口对象
+    .connect(new InetSocketAddress("localhost", 8088));
+
+// 为 ChannelFuture 添加监听器, 在连接完成后由nio线程执行回调内容
+channelFuture.addListener(new ChannelFutureListener() {
+    @Override
+    public void operationComplete(ChannelFuture future) throws Exception {
+        Channel channel = future.channel();
+        channel.writeAndFlush("Hello World");
+    }
+});
+```
+
+sync方法是将整个过程进行阻塞, 将异步变为同步
+
+监听器方法是保持异步性, 在特定的时机执行回调, 回调的内容将由另外的线程即 nio 线程进行处理
+
+### channel关闭处理
+
+现在设计一个客户端, 用于接收用户的输入, 并且在用户每次输入完成按下回车后都可以将数据发送到服务器, 并在按下 'q' 时退出
+
+```java
+@Slf4j
+public class SendIOClient {
+    public static void main(String[] args) {
+        // create client, and get channel future by connect method.
+        NioEventLoopGroup group = new NioEventLoopGroup();
+        ChannelFuture clientConnectFuture = new Bootstrap()
+                .group(group)
+                .channel(NioSocketChannel.class)
+                .handler(new ChannelInitializer<NioSocketChannel>() {
+                    @Override
+                    protected void initChannel(NioSocketChannel ch) throws Exception {
+                        ch.pipeline().addLast(new LoggingHandler(LogLevel.DEBUG));
+                        ch.pipeline().addLast(new StringEncoder(StandardCharsets.UTF_8));
+                    }
+                }).connect(new InetSocketAddress("localhost", 8088));
+
+        // get channel by client channel future.
+        Channel channel = clientConnectFuture.channel();
+        // after connecting, create new thread receive user input
+        // and put input message to server util user input 'q'.
+        // add listener for client connect future, this listener will listen connect event
+        // (after connect method connecting successful)
+        clientConnectFuture.addListener(new ChannelFutureListener() {
+            @Override
+            public void operationComplete(ChannelFuture future) throws Exception {
+                log.info("connect success, run scanner in input thread");
+                group.next().submit(()->{
+                    while (true){
+                        Scanner input = new Scanner(System.in);
+                        String line = input.nextLine();
+                        if ("q".equals(line)) {
+                            channel.close();
+                            break;
+                        }
+                        channel.writeAndFlush(line);
+                    }
+                });
+            }
+        });
+    }
+}
+```
+
+在上面的实现中, 通过 connect 方法连接成功得到一个 `ChannelFuture`, 并且绑定了一个监听器, 每次连接成功时会在 `EventLoopGroup` 中取出一个执行器, 类似一个线程来接收用户输入, 当用户输入的内容是 'q' 时, 将该连接的通道关闭.
+
+但是通道关闭后整个程序并不会停下, 因为在创建  NIOEventLoopGroup 的时候同时创建出来了多个线程, 连接通道关闭了但是仍然后很多线程在执行, 需要连同整个eventLoopGroup一起关闭才可以.
+
+如果在if语句块中执行group关闭操作会有一个问题, 执行接收用户输入的是group中的一个执行器, 而close方法是一个异步方法, 如果想在通道关闭完成后再执行相应的善后工作并不能保证都是在close完成之后再执行的, 例如打印一个程序关闭的日志, 这个日志可能出现在close方法执行完成之前
+
+```
+22:53:13.076 [nioEventLoopGroup-2-2] INFO  cc.sika.netty.channel.SendIOClient - close channel and exit
+22:53:13.076 [nioEventLoopGroup-2-1] DEBUG io.netty.handler.logging.LoggingHandler - [id: 0x5aa15679, L:/127.0.0.1:6072 - R:localhost/127.0.0.1:8088] CLOSE
+```
+
+想要真正完成善后工作, 需要通过该连接成功的channel对象的 `closeFuture` 方法得到一个 `ChannelFuture` 接口并将代码阻塞为同步, 等待成功关闭后再执行善后工作
+
+```java
+// closeFuture method mean gives you future, you can deal shutdown task after channel being closed,
+ChannelFuture channelFuture = channel.closeFuture();
+try {
+	// blocking main thread by closeFuture's sync method until channel closes success
+	channelFuture.sync();
+	log.info("after closing, now process shutdown task...");
+} catch (InterruptedException e) {
+	throw new RuntimeException(e);
+}
+```
+
+这种方式将阻塞整个main线程执行, 不符合nio思想
+
+netty提供了监听器回调的方式, 避免阻塞代码, 同样是在连接成功的channel对象调用  `closeFuture` 得到 `ChannelFuture` 并为该 future 添加监听器
+
+```java
+// note: just close channel, client has not been shutdown. because NioEventLoopGroup has other thread.
+// NioEventLoopGroup's shutdownGracefully method can
+// make all the thread in NioEventLoopGroup be shutdown
+// after thread task completing
+channel.closeFuture().addListener(new ChannelFutureListener() {
+    @Override
+    public void operationComplete(ChannelFuture future) throws Exception {
+        log.info("after closing, now process shutdown task...");
+        group.shutdownGracefully();
+    }
+});
+```
+
+该监听器的`operationComplete`方法逻辑会在通道真正关闭之后被执行.
+
 ## 2.3 Future & Promise
+
+### JUC--Future
+
+JUC包提供一个 Future 接口, 用于获取线程的任务执行状态, 主要与线程池和 callback 接口搭配使用.
+
+```java
+import java.util.concurrent.*;
+
+/**
+ * show how to use java.util.concurrent.Future with thread pool
+ * @author spirit
+ * @since 2024-09
+ */
+@Slf4j
+public class JDKFuture {
+    public static void main(String[] args) {
+        // create thread pool
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+
+        log.info("submit task");
+        Future<Integer> future = pool.submit(new Callable<Integer>() {
+            public Integer call() throws Exception {
+                Thread.sleep(2000);
+                return 1;
+            }
+        });
+        log.info("waiting result");
+        // future's get method is blocking, it will block until task complete
+        // so here need to wait for task complete (2000ms)
+        try {
+            log.info("result is {}", future.get());
+        } catch (InterruptedException|ExecutionException e) {
+            throw new RuntimeException(e);
+        }
+        pool.shutdown();
+    }
+}
+```
+
+future通过get方法, 阻塞等待直到任务完成返回计算结果
+
+### Netty--Future
+
+netty也提供一个Future接口, 扩展 JUC 的Future接口, 添加监听器相关功能方法, 判断成功失败相关方法, 等待以及将代码同步化相关方法以及获取结果的getNow()
+
+```java
+package io.netty.util.concurrent;
+
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.TimeUnit;
+
+public interface Future<V> extends java.util.concurrent.Future<V> {
+    boolean isSuccess();
+    boolean isCancellable();
+    Throwable cause();
+    Future<V> addListener(GenericFutureListener<? extends Future<? super V>> listener);
+    Future<V> addListeners(GenericFutureListener<? extends Future<? super V>>... listeners);
+    Future<V> removeListener(GenericFutureListener<? extends Future<? super V>> listener);
+    Future<V> removeListeners(GenericFutureListener<? extends Future<? super V>>... listeners);
+    Future<V> sync() throws InterruptedException;
+    Future<V> syncUninterruptibly();
+    Future<V> await() throws InterruptedException;
+    Future<V> awaitUninterruptibly();
+    boolean await(long timeout, TimeUnit unit) throws InterruptedException;
+    boolean await(long timeoutMillis) throws InterruptedException;
+    boolean awaitUninterruptibly(long timeout, TimeUnit unit);
+    boolean awaitUninterruptibly(long timeoutMillis);
+    /**
+     * Return the result without blocking. If the future is not done yet this will return {@code null}.
+     *
+     * As it is possible that a {@code null} value is used to mark the future as successful you also need to check
+     * if the future is really done with {@link #isDone()} and not rely on the returned {@code null} value.
+     */
+    V getNow();
+    @Override
+    boolean cancel(boolean mayInterruptIfRunning);
+}
+```
+
+因为netty提供的future接口增加了监听器相关功能, 所以可以使用监听器避免线程阻塞问题
+
+```java
+import io.netty.channel.EventLoop;
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.util.concurrent.Future;
+import io.netty.util.concurrent.GenericFutureListener;
+import lombok.extern.slf4j.Slf4j;
+
+/**
+ * show how to use io.netty.util.concurrent.Future with EventLoopGroup(as thread pool)
+ * @author spirit
+ * @since 2024-09
+ */
+@Slf4j
+public class NettyFuture {
+    public static void main(String[] args) {
+        // create event loop group(like thread pool)
+        EventLoopGroup group = new NioEventLoopGroup();
+        EventLoop eventLoop = group.next();
+
+        log.info("submit task");
+        Future<Integer> nettyFuture = eventLoop.submit(() -> {
+            Thread.sleep(1000);
+            return 1;
+        });
+        log.info("waiting for result");
+
+        // netty's future is blocking
+        // it has to wait for task completing and return result
+        /*try {
+            log.info("result is {}", nettyFuture.get());
+        } catch (ExecutionException | InterruptedException e) {
+            throw new RuntimeException(e);
+        }*/
+
+        // use listener and future's getNow method to obtain the task result asynchronously
+        nettyFuture.addListener(new GenericFutureListener<Future<? super Integer>>() {
+            @Override
+            public void operationComplete(Future<? super Integer> future) throws Exception {
+                log.info("result is {}", future.getNow());
+            }
+        });
+
+        // shutdown all thread in group
+        group.shutdownGracefully();
+    }
+}
+```
+
+### Netty--Promise
+
+Netty设计Promise继承自io.netty.util.concurrent.Future, 添加设置成功或失败的标记能力
+
+```java
+package io.netty.util.concurrent;
+public interface Promise<V> extends Future<V> {
+    Promise<V> setSuccess(V result);
+    boolean trySuccess(V result);
+    Promise<V> setFailure(Throwable cause);
+    boolean tryFailure(Throwable cause);
+    boolean setUncancellable();
+}
+```
+
+通过设置成功和失败可以结合监听器发挥更加灵活的能力
+
+```java
+import io.netty.channel.EventLoop;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.util.concurrent.DefaultPromise;
+import io.netty.util.concurrent.Future;
+import io.netty.util.concurrent.GenericFutureListener;
+import lombok.extern.slf4j.Slf4j;
+
+
+/**
+ * show how to use io.netty.util.concurrent.Promise.
+ * @author spirit
+ * @since 2024-09
+ */
+@Slf4j
+public class NettyPromise {
+    public static void main(String[] args) {
+        // create pool
+        NioEventLoopGroup loopGroup = new NioEventLoopGroup();
+        // get executor (thread)
+        EventLoop eventLoop = loopGroup.next();
+        // promise need one executor to run task
+        DefaultPromise<Integer> promise = new DefaultPromise<>(eventLoop);
+
+        // use another thread to simulate task, after completing it need to put result to promise
+        loopGroup.next().submit(()->{
+            log.info("starting task");
+            try {
+                Thread.sleep(1000);
+                int i = 1/0;
+                promise.setSuccess(23);
+            } catch (Exception e) {
+                // put error message
+                promise.setFailure(e);
+            }
+        });
+
+        log.info("waiting result...");
+        // the get method is from JDK's Future interface, so it is blocking
+//        try {
+//            log.info("result is {}", promise.get());
+//        } catch (InterruptedException | ExecutionException e) {
+//            throw new RuntimeException(e);
+//        }
+
+        // Promise interface extend netty's Future, so it has addListener method
+        // use listener can avoid synchronized
+        promise.addListener(new GenericFutureListener<Future<? super Integer>>() {
+            @Override
+            public void operationComplete(Future<? super Integer> future) throws Exception {
+                if (future.isSuccess()) {
+                    log.info("future.get() is {}", future.get());
+                    log.info("promise.get() is {}", promise.get());
+                }
+                else {
+                    log.error("promise.get() failed");
+                    log.error("failure cause", future.cause());
+                }
+
+            }
+        });
+
+        loopGroup.shutdownGracefully();
+    }
+}
+```
 
 ## 2.4 Handler & Pipeline
 
