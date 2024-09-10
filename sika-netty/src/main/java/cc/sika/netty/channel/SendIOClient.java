@@ -46,7 +46,7 @@ public class SendIOClient {
             @Override
             public void operationComplete(ChannelFuture future) throws Exception {
                 log.info("connect success, run scanner in input thread");
-                new Thread(()->{
+                group.next().submit(()->{
                     while (true){
                         Scanner input = new Scanner(System.in);
                         String line = input.nextLine();
@@ -56,7 +56,18 @@ public class SendIOClient {
                         }
                         channel.writeAndFlush(line);
                     }
-                }, "input").start();
+                });
+//                new Thread(()->{
+//                    while (true){
+//                        Scanner input = new Scanner(System.in);
+//                        String line = input.nextLine();
+//                        if ("q".equals(line)) {
+//                            channel.close();
+//                            break;
+//                        }
+//                        channel.writeAndFlush(line);
+//                    }
+//                }, "input").start();
             }
         });
         // closeFuture method mean gives you future, you can deal shutdown task after channel being closed,
