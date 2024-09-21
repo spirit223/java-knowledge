@@ -668,3 +668,322 @@ public class NettyPromise {
 ## 2.4 Handler & Pipeline
 
 ## 2.5 ByteBuf
+
+### 创建ByteBuf
+
+ByteBuf创建需要通过 `ByteBufAlloactor` 接口的`buffer()`方法分配。
+
+```java
+ByteBuf buff = ByteBufAllocator.DEFAULT.buffer();
+```
+
+这种方式分配出来的缓冲器是默认容量为256的可变缓冲区`PooledUnsafeDirectByteBuf`。
+
+```java
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufAllocator;
+import lombok.extern.slf4j.Slf4j;
+
+import java.nio.charset.StandardCharsets;
+
+/**
+ * alloc ByteBuf
+ * @author spirit
+ * @since 2024-09
+ */
+@Slf4j
+public class ByteBufCreator {
+    public static void main(String[] args) {
+        ByteBuf buff = ByteBufAllocator.DEFAULT.buffer();
+
+        log.info("buff = {}", buff);
+        
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < 300; i++) {
+            builder.append("a");
+        }
+
+        buff.writeBytes(builder.toString().getBytes(StandardCharsets.UTF_8));
+        log.info("buff = {}", buff);
+    }
+}
+```
+
+结果为:
+
+```shell
+21:52:28.980 [main] INFO  cc.sika.netty.buf.ByteBufCreator - buff = PooledUnsafeDirectByteBuf(ridx: 0, widx: 0, cap: 256)
+21:52:28.988 [main] INFO  cc.sika.netty.buf.ByteBufCreator - buff = PooledUnsafeDirectByteBuf(ridx: 0, widx: 300, cap: 512)
+```
+
+### 直接内存&堆内存
+
+调用分配器接口的`buffer()`方法得到的ByteBuf是直接内存。想要得到基于堆内存的ByteBuf可以使用`heapBuffer()` 方法得到。
+
+如果想要更加语义化的直接内存申请，可以使用`directBuffer()` 方法申请。
+
+直接内存和堆内存的缓冲区都有各自的优缺点：
+
+- 直接内存创建和销毁的代价昂贵，但读写性能高(少一次内存复制)，适合配合池化功能一起使用
+- 直接内存对GC压力小，因为这部分内存不受JVM垃圾回收管理，但也要注意及时主动释放
+
+```java
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufAllocator;
+import lombok.extern.slf4j.Slf4j;
+
+/**
+ * @author spirit
+ * @since 2024-09
+ */
+@Slf4j
+public class DifferenceByteBufCreator {
+    public static void main(String[] args) {
+        ByteBuf heapBuffer = ByteBufAllocator.DEFAULT.heapBuffer();
+        ByteBuf directBuffer = ByteBufAllocator.DEFAULT.directBuffer();
+
+        log.info("heap Buffer = {}", heapBuffer);
+        log.info("direct Buffer = {}", directBuffer);
+    }
+}
+```
+
+得到的结果为：
+
+```java
+22:06:21.724 [main] INFO  cc.sika.netty.buf.DifferenceByteBufCreator - heap Buffer = PooledUnsafeHeapByteBuf(ridx: 0, widx: 0, cap: 256)
+22:06:21.726 [main] INFO  cc.sika.netty.buf.DifferenceByteBufCreator - direct Buffer = PooledUnsafeDirectByteBuf(ridx: 0, widx: 0, cap: 256)
+```
+
+### 池化&非池化
+
+直接内存的申请和销毁都是很耗时的操作，而池化可以让缓冲区具备可重用的能力从而减少不必要的系统开销，如果没有池化，堆内存受GC影响也会相对浪费性能。
+
+在Netty中采用 `jemalloc`， 类似的内存分配算法提升分配效率，在高并发场景下池化更加节约内存也能够很好内存溢出问题出现
+
+池化功能默认启用，可以通过系统环境变量来指定开启或禁用：
+```shell
+-Dio.netty.allocator.type={unpooled|pooled}
+```
+
+在Netty4.1版本后默认启用池化并且在安卓平台下会关闭池化。
+
+在ByteBufUtil中核心代码体现为：
+```java
+static final ByteBufAllocator DEFAULT_ALLOCATOR;
+
+static {
+    String allocType = SystemPropertyUtil.get(
+            "io.netty.allocator.type", PlatformDependent.isAndroid() ? "unpooled" : "pooled");
+
+    ByteBufAllocator alloc;
+    if ("unpooled".equals(allocType)) {
+        alloc = UnpooledByteBufAllocator.DEFAULT;
+        logger.debug("-Dio.netty.allocator.type: {}", allocType);
+    } else if ("pooled".equals(allocType)) {
+        alloc = PooledByteBufAllocator.DEFAULT;
+        logger.debug("-Dio.netty.allocator.type: {}", allocType);
+    } else if ("adaptive".equals(allocType)) {
+        alloc = new AdaptiveByteBufAllocator();
+        logger.debug("-Dio.netty.allocator.type: {}", allocType);
+    } else {
+        alloc = PooledByteBufAllocator.DEFAULT;
+        logger.debug("-Dio.netty.allocator.type: pooled (unknown: {})", allocType);
+    }
+
+    DEFAULT_ALLOCATOR = alloc;
+
+    THREAD_LOCAL_BUFFER_SIZE = SystemPropertyUtil.getInt("io.netty.threadLocalDirectBufferSize", 0);
+    logger.debug("-Dio.netty.threadLocalDirectBufferSize: {}", THREAD_LOCAL_BUFFER_SIZE);
+
+    MAX_CHAR_BUFFER_SIZE = SystemPropertyUtil.getInt("io.netty.maxThreadLocalCharBufferSize", 16 * 1024);
+    logger.debug("-Dio.netty.maxThreadLocalCharBufferSize: {}", MAX_CHAR_BUFFER_SIZE);
+}
+```
+
+### 组成
+
+ByteBuf由四部分组成，分别为读写指针、容量与最大容量。
+
+初始申请ByteBuf时会拥有一个容量[capacity]默认256，读写指针都在0的位置，当往ByteBuf中插入数据时写指针会移动，超过容量后会自动扩容，为了让ByteBuf不超过内存容量，还会有一个最大容量限制。
+
+![](./doc-img/ByteBuf组成.png)
+
+往ByteBuf中写入数据时，写指针往后移动，读指针与写指针中间的区域为可读数据，读取数据后读指针也会移动，读取过的区域称为废弃部分。
+
+>  最大容量默认为 2147483647
+
+### 常用方法
+
+ByteBuf的常用方法有
+
+| 方法签名                                                | 含义                 | 备注                                           |
+| ------------------------------------------------------- | -------------------- | ---------------------------------------------- |
+| writeBoolean(boolean value)                             | 写入boolean值        | 用一个字节01\|00代表true\|false                |
+| writeByte(int value)                                    | 写入byte值           |                                                |
+| writeShort(int value)                                   | 写入short            |                                                |
+| writeInt(int value)                                     | 写入int值            | Big Endian，即0x250，写入后 `00 00 02 50`      |
+| writeIntLE(int value)                                   | 写入int值            | Little Endian，即0x250，写入后为 `50 02 00 00` |
+| writeLong(long value)                                   |                      |                                                |
+| writeChar(int value)                                    |                      |                                                |
+| writeFloat(float value)                                 |                      |                                                |
+| writeDouble(double value)                               |                      |                                                |
+| writeBytes(ByteBuf src)                                 | 将netty的ByteBuf写入 |                                                |
+| writeBytes(byte[] src)                                  | 将字节数组写入       |                                                |
+| writeBytes(ByteBUffer src)                              | 写入nio的ByteBuffer  |                                                |
+| writeCharSequence(CHarSequence string, Charset charset) | 写入字符串           |                                                |
+
+### 释放
+
+netty的ByteBuf类实现 `ReferenceCounted` 接口，为引用计数器对象，在每次使用完ByteBuf之后都需要调用 `release()` 方法释放。
+
+release方法会让缓冲器的引用计数减一，如果引用计数达到0会将对象释放掉.
+
+- UnpooledHeapByteBuf 使用的是JVM内存，只需等GC回收内存即可
+- UnpooledDirectByteBuf 使用直接内存，需要特殊的方法回收内存
+- PooledByteBuf 和它的子类使用池化技术，需要更复杂的规则回收内存
+
+通常情况下使用ByteBuf都是在handler中创建，并且一次入栈或者出栈都会存在多个处理器，可能在某个环节中处理好了ByteBuf，传递给下一个处理器时已经不是传递ByteBuf对象，此时就需要将ByteBuf释放。但是也不能在每次使用（每个处理器）中释放ByteBuf。
+
+#### 零拷贝--slice[切片]
+
+slice意为切片，可以将一个缓冲区ByteBuf切为多个片段，但是slice不会触及数据拷贝，也就被称为零拷贝。
+
+slice是为原有的ByteBuf添加标记，将一个ByteBuf切割为多个分片，使用的是同个物理内存，只是通过多个ByteBuf对象在逻辑上对ByteBuf做逻辑切片。
+
+切片后会生成一个新的ByteBuf对象，但是使用的还是与原ByteBuf对象同一份内存，修改切片后的新对象也会导致源缓冲区内容被修改。
+
+```java
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufAllocator;
+import lombok.extern.slf4j.Slf4j;
+
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+
+/**
+ * @author spirit
+ * @since 2024-09
+ */
+@Slf4j
+public class ByteBufSlice {
+    public static void main(String[] args) {
+        ByteBuf byteBuf = ByteBufAllocator.DEFAULT.directBuffer();
+
+        byteBuf.writeBytes(new byte[]{'a','b','c','d','e','f','g','h','i','j'});
+        byte[] bytes = new byte[byteBuf.readableBytes()];
+        byteBuf.getBytes(0, bytes, 0, bytes.length);
+        // now, byteBuf is [a, b, c, d, e, f, g, h, i, j]
+        log.info("byteBuf's content = {}", byteAyyToChar(bytes));
+
+        ByteBuf slice1 = byteBuf.slice(0, 5);
+        byte[] bytes1 = new byte[5];
+        slice1.getBytes(0, bytes1, 0, bytes1.length);
+        ByteBuf slice2 = byteBuf.slice(5, 5);
+        byte[] bytes2 = new byte[5];
+        slice2.getBytes(0, bytes2, 0, bytes2.length);
+        // slice1 is [a, b, c, d, e]
+        log.info("slice1's content = {}", byteAyyToChar(bytes1));
+        // slice2 is [f, g, h, i, j]
+        log.info("slice2's content = {}", byteAyyToChar(bytes2));
+
+        // change first character to '1' of slice1, see whether character was changed of byteBuf
+        slice1.setByte(0, '1');
+        log.info("after change slice1");
+        bytes = new byte[byteBuf.readableBytes()];
+        byteBuf.getBytes(0, bytes, 0, byteBuf.readableBytes());
+        // byteBuf = [1, b, c, d, e, f, g, h, i, j]
+        log.info("byteBuf = {}", byteAyyToChar(bytes));
+        bytes1 = new byte[5];
+        slice1.getBytes(0, bytes1, 0, bytes1.length);
+        // slice1 = [1, b, c, d, e]
+        log.info("slice1 = {}", byteAyyToChar(bytes1));
+        bytes2 = new byte[5];
+        slice2.getBytes(0, bytes2, 0, bytes2.length);
+        // slice2 = [f, g, h, i, j]
+        log.info("slice2 = {}", byteAyyToChar(bytes2));
+    }
+}
+```
+
+切片后得到的ByteBuf对象与直接申请到的对象不同，切片后的对象最大容量会被直接定死，避免空间不够时自动扩容导致的一系列问题。
+
+> 第一个切片扩容后，操作第一个切片的内容导致源缓冲区中属于切片2的内容被修改
+
+切片后的缓冲区对象内存属于源缓冲区的内存，如果对源缓冲区调用`release`方法释放掉了内存，也会导致切片后的ByteBuf不能访问该内存。
+
+在每次切片后都建议调用一次`retain`方法让缓冲区的计数器加1，在切片使用完后手动调用`release`避免使用到已经被释放的缓冲区。
+
+```java
+public static void main(String[] args) {
+    ByteBuf byteBuf = ByteBufAllocator.DEFAULT.directBuffer();
+
+    byteBuf.writeBytes(new byte[]{'a','b','c','d','e','f','g','h','i','j'});
+    byte[] bytes = new byte[byteBuf.readableBytes()];
+    byteBuf.getBytes(0, bytes, 0, bytes.length);
+    // now, byteBuf is [a, b, c, d, e, f, g, h, i, j]
+    log.info("byteBuf's content = {}", byteAyyToChar(bytes));
+
+    ByteBuf slice1 = byteBuf.slice(0, 5);
+    slice1.retain();
+    byte[] bytes1 = new byte[5];
+    slice1.getBytes(0, bytes1, 0, bytes1.length);
+    ByteBuf slice2 = byteBuf.slice(5, 5);
+    slice2.retain();
+    byte[] bytes2 = new byte[5];
+    slice2.getBytes(0, bytes2, 0, bytes2.length);
+    // slice1 is [a, b, c, d, e]
+    log.info("slice1's content = {}", byteAyyToChar(bytes1));
+    // slice2 is [f, g, h, i, j]
+    log.info("slice2's content = {}", byteAyyToChar(bytes2));
+
+    // change first character to '1' of slice1, see whether character was changed of byteBuf
+    slice1.setByte(0, '1');
+    log.info("after change slice1");
+    bytes = new byte[byteBuf.readableBytes()];
+    byteBuf.getBytes(0, bytes, 0, byteBuf.readableBytes());
+    // byteBuf = [1, b, c, d, e, f, g, h, i, j]
+    log.info("byteBuf = {}", byteAyyToChar(bytes));
+    bytes1 = new byte[5];
+    slice1.getBytes(0, bytes1, 0, bytes1.length);
+    // slice1 = [1, b, c, d, e]
+    log.info("slice1 = {}", byteAyyToChar(bytes1));
+    bytes2 = new byte[5];
+    slice2.getBytes(0, bytes2, 0, bytes2.length);
+    // slice2 = [f, g, h, i, j]
+    log.info("slice2 = {}", byteAyyToChar(bytes2));
+    slice1.release();
+    slice2.release();
+    byteBuf.release();
+}
+```
+
+#### 零拷贝--composite[合并]
+
+如果创建多个缓冲区并通过链式调用将多个缓冲区的内容写入到一个，可以达到数据合并的效果，但是会产生多次数据拷贝(取决合并的缓冲区数量).
+
+netty提供`CompositeByteBuf`, 让该缓冲区具备数据合并的能力并且不会产生数据拷贝。
+
+只需要对 `CompositeByteBuf` 对象调用 `addComponents` 方法即可完成数据合并。
+
+```java
+public class CompositeByteBufFromMultiBuffer {
+    public static void main(String[] args) {
+        ByteBuf byteBuf1 = ByteBufAllocator.DEFAULT.directBuffer(5);
+        ByteBuf byteBuf2 = ByteBufAllocator.DEFAULT.directBuffer(5);
+
+        byteBuf1.writeBytes(new byte[]{1, 2, 3, 4, 5});
+        byteBuf2.writeBytes(new byte[]{6, 7, 8, 9, 10});
+
+        // if we use this method, data will be copied twice.
+        ByteBuf bufferByAllocate = ByteBufAllocator.DEFAULT.buffer();
+        bufferByAllocate.writeBytes(byteBuf1).writeBytes(byteBuf2);
+
+        // this method will not copy data, just combine multiple buffer
+        CompositeByteBuf compositeByteBuf = ByteBufAllocator.DEFAULT.compositeBuffer();
+        // first parameters decision whether write pointer will be changed
+        compositeByteBuf.addComponents(true, byteBuf1, byteBuf2);
+    }
+}
+```
+
