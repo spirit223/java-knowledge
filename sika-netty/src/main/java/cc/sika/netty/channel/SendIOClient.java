@@ -46,8 +46,8 @@ public class SendIOClient {
             @Override
             public void operationComplete(ChannelFuture future) throws Exception {
                 log.info("connect success, run scanner in input thread");
-                group.next().submit(()->{
-                    while (true){
+                group.next().submit(() -> {
+                    while (true) {
                         Scanner input = new Scanner(System.in);
                         String line = input.nextLine();
                         if ("q".equals(line)) {
